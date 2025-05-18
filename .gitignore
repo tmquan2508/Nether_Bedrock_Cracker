@@ -15,4 +15,4 @@ Cargo.lock
 
 .idea/
 
-bedrock_cracker/netherbedrockcracker.h
+bedrock_cracker.h

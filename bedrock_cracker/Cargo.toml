@@ -5,8 +5,11 @@ edition = "2021"
 
 [lib]
 name = "bedrock_cracker"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 next_long_reverser = "0.1.0"
 java_random = "0.1.7"
+
+[build-dependencies]
+cbindgen = "0.28.0"
