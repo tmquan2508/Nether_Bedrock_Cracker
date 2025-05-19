@@ -145,11 +145,21 @@ pub struct VecI64 {
     len: usize
 }
 
-impl Into<VecI64> for Vec<i64> {
-    fn into(self) -> VecI64 {
-        VecI64 {
-            ptr: self.as_ptr(),
-            len: self.len(),
+#[no_mangle]
+pub extern "C" fn free_seed_vector(vec_i64: VecI64) {
+    if !vec_i64.ptr.is_null() && vec_i64.len > 0 {
+        unsafe {
+            let _ = Vec::from_raw_parts(vec_i64.ptr as *mut i64, vec_i64.len, vec_i64.len);
         }
+    }
+}
+
+impl Into<VecI64> for Vec<i64> {
+    fn into(mut self) -> VecI64 {
+        self.shrink_to_fit();
+        let ptr = self.as_ptr();
+        let len = self.len();
+        std::mem::forget(self);
+        VecI64 { ptr, len }
     }
 }
