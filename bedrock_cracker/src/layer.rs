@@ -232,9 +232,8 @@ impl<S: Sender> CrossComparison<S> {
     }
 }
 
+#[allow(dead_code)]
 pub fn flat_search<S: Sender + 'static>(seed_list: &[u64], roof_blocks: Arc<Vec<CheckObject>>, floor_blocks: Arc<Vec<CheckObject>>, sender: S) {
-
-
     let check_seed = |seed, blocks: &[CheckObject]| blocks.iter().all(|block| !block.check(seed));
 
     for (index, seed) in seed_list.iter().enumerate() {
