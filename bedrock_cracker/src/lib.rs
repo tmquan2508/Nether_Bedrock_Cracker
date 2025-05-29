@@ -1,35 +1,25 @@
-#[macro_use]
-extern crate lazy_static;
-
 mod block_data;
 mod layer;
 pub mod raw_data;
-mod progress_tracker;
 mod callback;
 
 use std::cmp::min;
 use std::sync::mpsc::{channel, Receiver as StdReceiver};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use crate::block_data::{BlockFilter, get_filter_power};
 use crate::layer::create_filter_tree;
 use crate::raw_data::block::Block;
 use crate::raw_data::modes::{BedrockGeneration, OutputMode};
-use crate::progress_tracker::{
-    ProgressData,
-    initialize_cracking_session,
-    finalize_cracking_session,
-    increment_processed_units,
-    should_stop_processing,
-    IS_CRACKING_ACTIVE_ATOMIC,
-    STOP_REQUESTED_ATOMIC,
-};
-use crate::callback::{SeedFoundCallback, CallbackAndCollectorSender};
+use crate::callback::{SeedFoundCallback, ProgressCallback, InitCallback, CallbackAndCollectorSender};
 
 const MASK48: u64 = 0xFFFF_FFFF_FFFF;
 const ROOF_HASH: u64 = 343340730;
 const FLOOR_HASH: u64 = 2042456806;
 const CHUNK_SIZE_FOR_LOGIC_INTERNAL: u64 = (1 << 12) * (1 << 25);
+
+static CRACKING_SHOULD_STOP_ATOMIC: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 pub struct VecI64 {
@@ -54,6 +44,8 @@ pub extern "C" fn crack_ffi(
     mode: BedrockGeneration,
     output_mode: OutputMode,
     java_seed_cb: SeedFoundCallback,
+    java_progress_cb: ProgressCallback,
+    java_init_cb: InitCallback,
 ) -> VecI64 {
     if blocks_ptr.is_null() || len == 0 || threads == 0 {
         return VecI64 { ptr: std::ptr::null(), len: 0 };
@@ -61,13 +53,17 @@ pub extern "C" fn crack_ffi(
     let blocks: &[Block] = unsafe { std::slice::from_raw_parts(blocks_ptr, len) };
     let blocks_owned = blocks.to_vec();
 
-    let total_search_space: u64 = (1u64 << 36) << 12;
-    initialize_cracking_session(total_search_space);
+    let total_search_space_units: u64 = (1u64 << 36) << 12;
+
+    if let Some(init_cb) = java_init_cb {
+        init_cb(total_search_space_units, 0);
+    }
 
     let (rust_seed_collector_tx, rust_seed_collector_rx) = channel::<i64>();
 
     let callback_sender = CallbackAndCollectorSender::new(
         java_seed_cb,
+        java_progress_cb,
         rust_seed_collector_tx,
     );
 
@@ -78,30 +74,20 @@ pub extern "C" fn crack_ffi(
         output_mode,
         callback_sender,
         rust_seed_collector_rx,
+        total_search_space_units,
     );
 
-    finalize_cracking_session();
     collected_seeds_vec.into()
 }
 
 #[no_mangle]
-pub extern "C" fn get_crack_progress_ffi() -> ProgressData {
-    let mut data = progress_tracker::CRACK_PROGRESS_REPORTER.lock().unwrap().clone();
-    data.is_cracking_active = IS_CRACKING_ACTIVE_ATOMIC.load(std::sync::atomic::Ordering::Relaxed);
-    data
-}
-
-#[no_mangle]
-pub extern "C" fn reset_crack_progress_externally_ffi() {
-    let mut progress_guard = progress_tracker::CRACK_PROGRESS_REPORTER.lock().unwrap();
-    progress_guard.reset();
-    IS_CRACKING_ACTIVE_ATOMIC.store(false, std::sync::atomic::Ordering::Relaxed);
-    STOP_REQUESTED_ATOMIC.store(false, std::sync::atomic::Ordering::Relaxed);
+pub extern "C" fn reset_cracker_state_ffi() {
+    CRACKING_SHOULD_STOP_ATOMIC.store(false, Ordering::Relaxed);
 }
 
 #[no_mangle]
 pub extern "C" fn request_stop_crack_ffi() {
-    STOP_REQUESTED_ATOMIC.store(true, std::sync::atomic::Ordering::Relaxed);
+    CRACKING_SHOULD_STOP_ATOMIC.store(true, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -127,6 +113,7 @@ fn internal_crack<S: crate::raw_data::sender::Sender + Clone + Send + Sync + 'st
     output_mode: OutputMode,
     sender_for_layers: S,
     final_seed_collector_rx: StdReceiver<i64>,
+    _total_search_space_units: u64,
 ) -> Vec<i64> {
     search_bedrock_pattern_internal(
         &blocks,
@@ -154,22 +141,23 @@ fn search_bedrock_pattern_internal<S: crate::raw_data::sender::Sender + Clone + 
 ) {
     let layers = create_filter_tree(blocks, mode, output, sender_instance.clone());
 
-    let total_tasks_overall = 1u64 << 36;
+    let total_tasks_for_threading = 1u64 << 36;
     let mut thread_handles = Vec::new();
 
     for thread_idx in 0..thread_count {
-        let start_task_idx = (thread_idx * total_tasks_overall) / thread_count;
-        let end_task_idx = ((thread_idx + 1) * total_tasks_overall) / thread_count;
+        let start_task_idx = (thread_idx * total_tasks_for_threading) / thread_count;
+        let end_task_idx = ((thread_idx + 1) * total_tasks_for_threading) / thread_count;
 
         let start_bits = start_task_idx << 12;
         let end_bits = end_task_idx << 12;
 
         let layers_clone = layers.clone();
+        let sender_clone_for_thread_progress = sender_instance.clone();
 
         let handle = thread::spawn(move || {
             let mut current_pos_in_thread_segment = start_bits;
             while current_pos_in_thread_segment < end_bits {
-                if should_stop_processing() {
+                if CRACKING_SHOULD_STOP_ATOMIC.load(Ordering::Relaxed) {
                     return;
                 }
 
@@ -177,10 +165,13 @@ fn search_bedrock_pattern_internal<S: crate::raw_data::sender::Sender + Clone + 
                 let units_in_this_chunk = chunk_process_end - current_pos_in_thread_segment;
 
                 for upper_bits_base in (current_pos_in_thread_segment..chunk_process_end).step_by(1 << 12) {
+                     if CRACKING_SHOULD_STOP_ATOMIC.load(Ordering::Relaxed) {
+                        return;
+                    }
                     layers_clone.run_checks(upper_bits_base);
                 }
 
-                increment_processed_units(units_in_this_chunk);
+                sender_clone_for_thread_progress.send(CrackProgress::Progress(units_in_this_chunk));
                 current_pos_in_thread_segment = chunk_process_end;
             }
         });
@@ -188,7 +179,9 @@ fn search_bedrock_pattern_internal<S: crate::raw_data::sender::Sender + Clone + 
     }
 
     for handle in thread_handles {
-        handle.join().expect("A cracking thread panicked");
+        if let Err(e) = handle.join() {
+            eprintln!("A cracking thread panicked: {:?}", e);
+        }
     }
 }
 
