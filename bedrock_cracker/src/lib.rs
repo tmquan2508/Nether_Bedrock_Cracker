@@ -33,7 +33,10 @@ pub extern "C" fn estimate_result_amount_ffi(blocks_ptr: *const Block, len: usiz
         return 0;
     }
     let blocks: &[Block] = unsafe { std::slice::from_raw_parts(blocks_ptr, len) };
-    internal_estimate_result_amount(blocks)
+    let filters: Vec<_> = blocks.iter()
+        .map(|block| BlockFilter::from(block, BedrockGeneration::Normal))
+        .collect();
+    get_filter_power(&filters)
 }
 
 #[no_mangle]
@@ -67,17 +70,22 @@ pub extern "C" fn crack_ffi(
         rust_seed_collector_tx,
     );
 
-    let collected_seeds_vec = internal_crack(
-        blocks_owned,
+    execute_cracking(
+        &blocks_owned,
         threads,
         mode,
         output_mode,
         callback_sender,
-        rust_seed_collector_rx,
-        total_search_space_units,
     );
 
-    collected_seeds_vec.into()
+    let mut seeds_vec = vec![];
+    while let Ok(seed) = rust_seed_collector_rx.recv() {
+        seeds_vec.push(seed);
+    }
+    seeds_vec.sort_unstable();
+    seeds_vec.dedup();
+    
+    seeds_vec.into()
 }
 
 #[no_mangle]
@@ -99,40 +107,7 @@ pub extern "C" fn free_seed_vector_ffi(vec_i64: VecI64) {
     }
 }
 
-fn internal_estimate_result_amount(blocks: &[Block]) -> u64 {
-    let filters: Vec<_> = blocks.iter()
-        .map(|block| BlockFilter::from(block, BedrockGeneration::Normal))
-        .collect();
-    get_filter_power(&filters)
-}
-
-fn internal_crack<S: crate::raw_data::sender::Sender + Clone + Send + Sync + 'static>(
-    blocks: Vec<Block>,
-    threads: u64,
-    mode: BedrockGeneration,
-    output_mode: OutputMode,
-    sender_for_layers: S,
-    final_seed_collector_rx: StdReceiver<i64>,
-    _total_search_space_units: u64,
-) -> Vec<i64> {
-    search_bedrock_pattern_internal(
-        &blocks,
-        threads,
-        mode,
-        output_mode,
-        sender_for_layers,
-    );
-
-    let mut seeds_vec = vec![];
-    while let Ok(seed) = final_seed_collector_rx.recv() {
-        seeds_vec.push(seed);
-    }
-    seeds_vec.sort_unstable();
-    seeds_vec.dedup();
-    seeds_vec
-}
-
-fn search_bedrock_pattern_internal<S: crate::raw_data::sender::Sender + Clone + Send + Sync + 'static>(
+fn execute_cracking<S: crate::raw_data::sender::Sender + Clone + Send + Sync + 'static>(
     blocks: &[Block],
     thread_count: u64,
     mode: BedrockGeneration,
