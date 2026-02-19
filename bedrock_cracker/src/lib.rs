@@ -4,7 +4,7 @@ pub mod raw_data;
 mod callback;
 
 use std::cmp::min;
-use std::sync::mpsc::{channel, Receiver as StdReceiver};
+use std::sync::mpsc::{channel};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
